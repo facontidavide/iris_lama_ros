@@ -9,7 +9,7 @@ endif()
 find_package(Eigen3 REQUIRED NO_MODULE)
 # find_package(iris_lama REQUIRED)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(yaml-cpp REQUIRED)

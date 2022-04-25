@@ -32,6 +32,7 @@
  */
 
 #include <cstdlib>
+#include <algorithm>
 
 #include <nav_msgs/GetMap.h>
 
@@ -63,8 +64,6 @@ lama::Loc2DROS::Loc2DROS()
     pnh_.param("use_map_sideloading", use_map_sideloading, false);
     pnh_.param("map_sideloading_dir", map_sideloading_dir, std::string(""));
 
-    pnh_.param("force_update_on_initial_pose", force_update_on_initial_pose_, false);
-
     // Setup TF workers ...
     tf_ = new tf::TransformListener();
     tfb_= new tf::TransformBroadcaster();
@@ -72,6 +71,7 @@ lama::Loc2DROS::Loc2DROS()
     // Setup subscribers
     // Syncronized LaserScan messages with odometry transforms. This ensures that an odometry transformation
     // exists when the handler of a LaserScan message is called.
+
     laser_scan_sub_    = new message_filters::Subscriber<sensor_msgs::LaserScan>(nh_, scan_topic_, 100, ros::TransportHints().tcpNoDelay());
     laser_scan_filter_ = new tf::MessageFilter<sensor_msgs::LaserScan>(*laser_scan_sub_, *tf_, odom_frame_id_, 100);
     laser_scan_filter_->registerCallback(boost::bind(&Loc2DROS::onLaserScan, this, _1));
@@ -81,8 +81,9 @@ lama::Loc2DROS::Loc2DROS()
     // Set publishers
     pose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("pose", 2, true);
 
+    rmse_pub_ = nh_.advertise<std_msgs::Float64>("rmse_error",10);
+
     // Services
-    srv_update_ = nh_.advertiseService("request_nomotion_update", &Loc2DROS::onTriggerUpdate, this);
     srv_global_loc_ = nh_.advertiseService("global_localization", &Loc2DROS::globalLocalizationCallback, this);
 
     // Fetch algorithm options
@@ -92,8 +93,6 @@ lama::Loc2DROS::Loc2DROS()
     pnh_.param("initial_pos_a", init_a, 0.0);
     initial_prior_ = lama::Pose2D(pos, init_a);
 
-    pnh_.param("d_thresh", options_.trans_thresh, 0.1);
-    pnh_.param("a_thresh", options_.rot_thresh, 0.2);
     pnh_.param("l2_max",   options_.l2_max, 0.5);
     pnh_.param("strategy", options_.strategy, std::string("gn"));
 
@@ -191,7 +190,6 @@ lama::Loc2DROS::Loc2DROS()
         loc2d_.triggerGlobalLocalization();
     }
 
-
     ROS_INFO("2D Localization node up and running");
 }
 
@@ -234,7 +232,6 @@ void lama::Loc2DROS::onInitialPose(const Pose2D& prior)
 {
     ROS_INFO("Setting pose to (%f, %f, %f)", prior.x(), prior.y() ,prior.rotation());
     loc2d_.setPose(prior);
-    force_update_ = force_update_on_initial_pose_;
     current_orientation_ = tf::createQuaternionFromYaw(prior.rotation());
     publishCurrentPose();
 }
@@ -266,98 +263,115 @@ void lama::Loc2DROS::onLaserScan(const sensor_msgs::LaserScanConstPtr& laser_sca
 
     lama::Pose2D odom(odom_tf.getOrigin().x(), odom_tf.getOrigin().y(),
                               tf::getYaw(odom_tf.getRotation()));
+    static bool first_odom = true;
+    if( first_odom )
+    {
+        prev_odom_ = odom;
+        first_odom = false;
+    }
 
+    const size_t size = laser_scan->ranges.size();
 
-    // Force an update if the last update was a long time ago.
-    static ros::Time latest_update = laser_scan->header.stamp;
-    if ((not force_update_) and temporal_update_ > 0)
-        force_update_ = (laser_scan->header.stamp - latest_update).toSec() > temporal_update_;
+    float max_range;
+    if (max_range_ == 0.0 || max_range_ > laser_scan->range_max)
+        max_range = laser_scan->range_max;
+    else
+        max_range = max_range_;
 
-    bool update = force_update_ or loc2d_.enoughMotion(odom);
+    float min_range = laser_scan->range_min;
+    float angle_min = laser_scan->angle_min;
+    float angle_inc = laser_scan->angle_increment;
 
-    if (update){
+    PointCloudXYZ::Ptr cloud(new PointCloudXYZ);
 
-        const size_t size = laser_scan->ranges.size();
+    cloud->sensor_origin_ = lasers_origin_[laser_index].xyz();
+    cloud->sensor_orientation_ = Quaterniond(lasers_origin_[laser_index].state.so3().matrix());
 
-        float max_range;
-        if (max_range_ == 0.0 || max_range_ > laser_scan->range_max)
-            max_range = laser_scan->range_max;
-        else
-            max_range = max_range_;
+    cloud->points.reserve(size);
+    for(size_t i = 0; i < size; i += beam_step_ ){
+        double range;
 
-        float min_range = laser_scan->range_min;
-        float angle_min = laser_scan->angle_min;
-        float angle_inc = laser_scan->angle_increment;
+        range = laser_scan->ranges[i];
 
-        PointCloudXYZ::Ptr cloud(new PointCloudXYZ);
+        if (not std::isfinite(range))
+            continue;
 
-        cloud->sensor_origin_ = lasers_origin_[laser_index].xyz();
-        cloud->sensor_orientation_ = Quaterniond(lasers_origin_[laser_index].state.so3().matrix());
+        if (range >= max_range || range <= min_range)
+            continue;
 
-        cloud->points.reserve(size);
-        for(size_t i = 0; i < size; i += beam_step_ ){
-            double range;
+        Eigen::Vector3d point;
+        point << range * std::cos(angle_min+(i*angle_inc)),
+          range * std::sin(angle_min+(i*angle_inc)),
+          0;
 
-            range = laser_scan->ranges[i];
+        cloud->points.push_back( point );
+    }
 
-            if (not std::isfinite(range))
-                continue;
+    // calculate predicted_pose, that is the new pose considering odometry only
+    Pose2D odom_delta = prev_odom_ - odom; // order is counter-intuitive, but correct
+    Pose2D prev_pose = loc2d_.getPose();
+    Pose2D predicted_pose  = prev_pose + odom_delta;
+    prev_odom_ = odom;
 
-            if (range >= max_range || range <= min_range)
-                continue;
+    loc2d_.update(cloud, odom, laser_scan->header.stamp.toSec(), true);
 
+    double error_rmse = loc2d_.getRMSE();
+    std_msgs::Float64 msg;
+    msg.data = error_rmse;
+    rmse_pub_.publish(msg);
 
-            Eigen::Vector3d point;
-            point << range * std::cos(angle_min+(i*angle_inc)),
-                     range * std::sin(angle_min+(i*angle_inc)),
-                     0;
+    // Don't trust an update that makes the RMSE 5% worst or more.
+    // Prefer the predicted pose from odometry instead
+    if( (error_rmse - prev_error_rmse_) > prev_error_rmse_ * 1.05 &&
+        prev_error_rmse_ > 0.0 )
+    {
+        loc2d_.setPose(predicted_pose);
+        ROS_WARN("Discarting localization, because match_error increase: %f -> %f",
+                 prev_error_rmse_, error_rmse);
+    }
+    prev_error_rmse_ = error_rmse;
 
-            cloud->points.push_back( point );
+    // Limit the amount of correction, when compared to predicted_pose
+    Pose2D pose_delta = predicted_pose - loc2d_.getPose();
+    double clamped_x = std::clamp(pose_delta.x(), -0.1, 0.1);
+    double clamped_y = std::clamp(pose_delta.y(), -0.1, 0.1);
+    double clamped_rot = std::clamp(pose_delta.rotation(), -0.1, 0.1);
+
+    Pose2D loc2d_pose = predicted_pose + Pose2D(clamped_x, clamped_y, clamped_rot);
+    loc2d_.setPose(loc2d_pose);
+
+    // Report global localization if enables
+    if (loc2d_.globalLocalizationIsActive()){
+        ROS_INFO("Global Localization RMSE: %f", error_rmse);
+    }
+
+    current_orientation_ = tf::createQuaternionFromYaw(loc2d_pose.rotation());
+
+    if (publish_tf_){
+        // subtracting base to odom from map to base and send map to odom instead
+        tf::Stamped<tf::Pose> odom_to_map;
+        try{
+            tf::Transform tmp_tf(current_orientation_, tf::Vector3(loc2d_pose.x(), loc2d_pose.y(), 0));
+            tf::Stamped<tf::Pose> tmp_tf_stamped (tmp_tf.inverse(), laser_scan->header.stamp, base_frame_id_);
+            tf_->transformPose(odom_frame_id_, tmp_tf_stamped, odom_to_map);
+
+        }catch(tf::TransformException){
+            ROS_WARN("Failed to subtract base to odom transform");
+            return;
         }
 
-        loc2d_.update(cloud, odom, laser_scan->header.stamp.toSec(), force_update_);
-        force_update_ = false;
-        latest_update = laser_scan->header.stamp;
+        latest_tf_ = tf::Transform(tf::Quaternion(odom_to_map.getRotation()),
+                                   tf::Point(odom_to_map.getOrigin()));
 
-        // Report global localization if enables
-        if (loc2d_.globalLocalizationIsActive()){
-            ROS_INFO("Global Localization RMSE: %f", loc2d_.getRMSE());
-        }
-
-        current_orientation_ = tf::createQuaternionFromYaw(loc2d_.getPose().rotation());
-
-        if (publish_tf_){
-            // subtracting base to odom from map to base and send map to odom instead
-            tf::Stamped<tf::Pose> odom_to_map;
-            try{
-                tf::Transform tmp_tf(current_orientation_, tf::Vector3(loc2d_.getPose().x(), loc2d_.getPose().y(), 0));
-                tf::Stamped<tf::Pose> tmp_tf_stamped (tmp_tf.inverse(), laser_scan->header.stamp, base_frame_id_);
-                tf_->transformPose(odom_frame_id_, tmp_tf_stamped, odom_to_map);
-
-            }catch(tf::TransformException){
-                ROS_WARN("Failed to subtract base to odom transform");
-                return;
-            }
-
-            latest_tf_ = tf::Transform(tf::Quaternion(odom_to_map.getRotation()),
-                    tf::Point(odom_to_map.getOrigin()));
-
-            // We want to send a transform that is good up until a
-            // tolerance time so that odom can be used
-            ros::Time transform_expiration = (laser_scan->header.stamp + transform_tolerance_);
-            tf::StampedTransform tmp_tf_stamped(latest_tf_.inverse(), transform_expiration,
-                    global_frame_id_, odom_frame_id_);
-            tfb_->sendTransform(tmp_tf_stamped);
-        }
-
-        publishCurrentPose();
-    } else if (publish_tf_) {
-        // Nothing has change, therefore, republish the last transform.
+        // We want to send a transform that is good up until a
+        // tolerance time so that odom can be used
         ros::Time transform_expiration = (laser_scan->header.stamp + transform_tolerance_);
         tf::StampedTransform tmp_tf_stamped(latest_tf_.inverse(), transform_expiration,
                                             global_frame_id_, odom_frame_id_);
         tfb_->sendTransform(tmp_tf_stamped);
-    } // end if (update)
+    }
+
+    publishCurrentPose();
 }
 
 void lama::Loc2DROS::onMapReceived(const nav_msgs::OccupancyGridConstPtr& msg)
@@ -421,19 +435,12 @@ bool lama::Loc2DROS::initLaser(const sensor_msgs::LaserScanConstPtr& laser_scan)
                     roll, pitch, yaw);
 
     lasers_origin_.push_back( lp );
-        ROS_INFO("Laser is mounted upwards.");
+    ROS_INFO("Laser is mounted upwards.");
 
     int laser_index = (int)frame_to_laser_.size();  // simple ID generator :)
     frame_to_laser_[laser_scan->header.frame_id] = laser_index;
 
     ROS_INFO("New laser configured (id=%d frame_id=%s)", laser_index, laser_scan->header.frame_id.c_str() );
-    return true;
-}
-
-bool lama::Loc2DROS::onTriggerUpdate(std_srvs::Empty::Request&, std_srvs::Empty::Response&)
-{
-    ROS_INFO("Forced localization update Triggered");
-    force_update_ = true;
     return true;
 }
 

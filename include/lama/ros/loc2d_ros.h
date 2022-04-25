@@ -41,6 +41,7 @@
 #include <tf/transform_listener.h>
 #include <tf/message_filter.h>
 #include <tf/tf.h>
+#include <std_msgs/Float64.h>
 
 #include <message_filters/subscriber.h>
 
@@ -110,13 +111,13 @@ private:
 
     // Publishers
     ros::Publisher pose_pub_; ///< Publishers of the pose with covariance
+    ros::Publisher rmse_pub_;
 
     // Subscribers
     ros::Subscriber pose_sub_;   ///< Subscriber of the initial pose (with covariance)
-    ros::Subscriber map_sub_; ///< Subscriber of the map; used if \p use_map_topic_ is true.
+    ros::Subscriber map_sub_;
 
     // Service providers
-    ros::ServiceServer srv_update_; ///< Service to trigger a scan match
     ros::ServiceServer srv_global_loc_; ///< Used to trigger global localization on request.
 
     // == Laser stuff ==
@@ -138,12 +139,11 @@ private:
     bool first_map_only_;               ///< True to use only the first map ever received
     bool first_map_received_;           ///< True if the first map has already been received
     bool use_pose_on_new_map_;          ///< True to use the current algorithm pose when the map changes
-    bool force_update_;                 ///< True to force an update when a new laser scan is received
-    bool force_update_on_initial_pose_; ///< True to trigger a forced updated when an initial pose is received
 
     // == Inner state ==
     Loc2D   loc2d_;
-    Pose2D odom_;
+    Pose2D prev_odom_;
+    double prev_error_rmse_ = 0.0;
     Loc2D::Options options_;
     Pose2D initial_prior_;
     tf::Quaternion current_orientation_;
