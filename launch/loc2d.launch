@@ -37,7 +37,7 @@
         <param name="initial_pos_a" value="$(arg initial_yaw)"/>
 
         <!-- Maximum distance to use in the dynamic Euclidean distance map (default: 0.5 meters). -->
-        <param name="l2_max" value="0.4"/>
+        <param name="l2_max" value="0.3"/>
         <!-- Scan matching optimization strategy, GaussNewton ("gm") or Levenberg Marquard ("lm") (default: "gn"). -->
         <param name="strategy" value="gn"/>
 

@@ -232,6 +232,7 @@ void lama::Loc2DROS::onInitialPose(const Pose2D& prior)
 {
     ROS_INFO("Setting pose to (%f, %f, %f)", prior.x(), prior.y() ,prior.rotation());
     loc2d_.setPose(prior);
+    prev_error_rmse_ = 0.0;
     current_orientation_ = tf::createQuaternionFromYaw(prior.rotation());
     publishCurrentPose();
 }
@@ -336,6 +337,14 @@ void lama::Loc2DROS::onLaserScan(const sensor_msgs::LaserScanConstPtr& laser_sca
     double clamped_x = std::clamp(pose_delta.x(), -0.1, 0.1);
     double clamped_y = std::clamp(pose_delta.y(), -0.1, 0.1);
     double clamped_rot = std::clamp(pose_delta.rotation(), -0.1, 0.1);
+
+    if( abs(pose_delta.x() - clamped_x) > 0.001 ||
+        abs(pose_delta.y() - clamped_y) > 0.001 ||
+        abs(pose_delta.rotation() - clamped_rot) > 0.001 )
+    {
+        ROS_WARN("Clamping pose correction: %f  %f  %f",
+                 pose_delta.x(), pose_delta.y(), pose_delta.rotation());
+    }
 
     Pose2D loc2d_pose = predicted_pose + Pose2D(clamped_x, clamped_y, clamped_rot);
     loc2d_.setPose(loc2d_pose);
