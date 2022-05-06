@@ -36,6 +36,9 @@
         <!-- Initial rotation (or angle) (default: 0 rad). -->
         <param name="initial_pos_a" value="$(arg initial_yaw)"/>
 
+        <!-- If true, points that are too close to the previous one, will be removed -->
+        <param name="scan_resampling" value="true"/>
+
         <!-- Maximum distance to use in the dynamic Euclidean distance map (default: 0.5 meters). -->
         <param name="l2_max" value="0.3"/>
         <!-- Scan matching optimization strategy, GaussNewton ("gm") or Levenberg Marquard ("lm") (default: "gn"). -->

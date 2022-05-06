@@ -87,8 +87,6 @@ private:
 
     bool initLaser(const sensor_msgs::LaserScanConstPtr& laser_scan);
 
-    // A localization update can be forced by an external trigger.
-    bool onTriggerUpdate(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
     // Trigger a global localization procedure.
     bool globalLocalizationCallback(std_srvs::Empty::Request& req, std_srvs::Empty::Response& resp);
 
@@ -131,6 +129,7 @@ private:
     std::string base_frame_id_;         ///< Robot base frame.
 
     std::string scan_topic_;            ///< LaserScan message topic.
+    bool scan_resampling_;              ///< If true, remove from scan points that are too close to each other.
 
     double temporal_update_;            ///< Force an update when the last processed scan is older than this.
 

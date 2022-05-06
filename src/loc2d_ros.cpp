@@ -50,6 +50,7 @@ lama::Loc2DROS::Loc2DROS()
     pnh_.param("base_frame_id",   base_frame_id_,   std::string("base_link"));
 
     pnh_.param("scan_topic", scan_topic_, std::string("scan"));
+    pnh_.param("scan_resampling", scan_resampling_, false);
 
     pnh_.param("transform_tolerance", tmp, 0.1); transform_tolerance_.fromSec(tmp);
     pnh_.param("temporal_update", temporal_update_, 0.0);
@@ -289,6 +290,8 @@ void lama::Loc2DROS::onLaserScan(const sensor_msgs::LaserScanConstPtr& laser_sca
     cloud->sensor_orientation_ = Quaterniond(lasers_origin_[laser_index].state.so3().matrix());
 
     cloud->points.reserve(size);
+    const double DISTANCE_THRESHOLD_SQR = (options_.resolution * options_.resolution) / 4.0;
+
     for(size_t i = 0; i < size; i += beam_step_ ){
         double range;
 
@@ -305,7 +308,13 @@ void lama::Loc2DROS::onLaserScan(const sensor_msgs::LaserScanConstPtr& laser_sca
           range * std::sin(angle_min+(i*angle_inc)),
           0;
 
-        cloud->points.push_back( point );
+        // apply scan resampling: do not add points that are too close
+        if( !scan_resampling_ ||
+            cloud->points.empty() ||
+            ( cloud->points.back() - point).squaredNorm() >= DISTANCE_THRESHOLD_SQR )
+        {
+            cloud->points.push_back( point );
+        }
     }
 
     // calculate predicted_pose, that is the new pose considering odometry only
@@ -334,33 +343,27 @@ void lama::Loc2DROS::onLaserScan(const sensor_msgs::LaserScanConstPtr& laser_sca
 
     // Limit the amount of correction, when compared to predicted_pose
     Pose2D pose_delta = predicted_pose - loc2d_.getPose();
-    double clamped_x = std::clamp(pose_delta.x(), -0.1, 0.1);
-    double clamped_y = std::clamp(pose_delta.y(), -0.1, 0.1);
-    double clamped_rot = std::clamp(pose_delta.rotation(), -0.1, 0.1);
+    auto Clamp = [](double val, double clamp) { return std::clamp(val, -clamp, clamp); };
 
-    if( abs(pose_delta.x() - clamped_x) > 0.001 ||
-        abs(pose_delta.y() - clamped_y) > 0.001 ||
-        abs(pose_delta.rotation() - clamped_rot) > 0.001 )
-    {
-        ROS_WARN("Clamping pose correction: %f  %f  %f",
-                 pose_delta.x(), pose_delta.y(), pose_delta.rotation());
-    }
+    double clamped_x = Clamp(pose_delta.x(), 0.02);
+    double clamped_y = Clamp(pose_delta.y(), 0.01);
+    double clamped_rot = Clamp(pose_delta.rotation(), M_PI / 180);
 
-    Pose2D loc2d_pose = predicted_pose + Pose2D(clamped_x, clamped_y, clamped_rot);
-    loc2d_.setPose(loc2d_pose);
+    Pose2D corrected_pose = predicted_pose + Pose2D(clamped_x, clamped_y, clamped_rot);
+    loc2d_.setPose(corrected_pose);
 
     // Report global localization if enables
     if (loc2d_.globalLocalizationIsActive()){
         ROS_INFO("Global Localization RMSE: %f", error_rmse);
     }
 
-    current_orientation_ = tf::createQuaternionFromYaw(loc2d_pose.rotation());
+    current_orientation_ = tf::createQuaternionFromYaw(loc2d_.getPose().rotation());
 
     if (publish_tf_){
         // subtracting base to odom from map to base and send map to odom instead
         tf::Stamped<tf::Pose> odom_to_map;
         try{
-            tf::Transform tmp_tf(current_orientation_, tf::Vector3(loc2d_pose.x(), loc2d_pose.y(), 0));
+            tf::Transform tmp_tf(current_orientation_, tf::Vector3(loc2d_.getPose().x(), loc2d_.getPose().y(), 0));
             tf::Stamped<tf::Pose> tmp_tf_stamped (tmp_tf.inverse(), laser_scan->header.stamp, base_frame_id_);
             tf_->transformPose(odom_frame_id_, tmp_tf_stamped, odom_to_map);
 
